@@ -45,6 +45,7 @@
     display:block;width:100%;height:100%;
     background:var(--sky-bottom);
     touch-action:none;
+    cursor:crosshair;
   }
   #hud{
     position:absolute;top:0;left:0;right:0;
@@ -131,7 +132,6 @@
       <div class="tbtn" id="jumpBtn">PULAR</div>
     </div>
 
-    <!-- MENU PRINCIPAL -->
     <div class="overlay" id="mainMenu">
       <div class="card">
         <h1>🐱☁️ Gatinho nas Nuvens</h1>
@@ -144,7 +144,6 @@
       </div>
     </div>
 
-    <!-- TELA DE PERSONALIZAÇÃO -->
     <div class="overlay hidden" id="customScreen">
       <div class="card">
         <h2>Personalizar Gatinho</h2>
@@ -160,13 +159,12 @@
       </div>
     </div>
 
-    <!-- TELA DE INSTRUÇÕES -->
     <div class="overlay hidden" id="startScreen">
       <div class="card">
         <h1>🐱☁️ Gatinho nas Nuvens</h1>
         <p id="modeDesc">Corra, escale torres, use o estilingue e colete peixinhos dourados!</p>
         <p class="small">◀▶ / A D para mover • ESPAÇO ou seta pra cima para pular.</p>
-        <p class="small">Fique parado sobre o <b>estilingue</b> e segure o botão de pular para carregar; solte para ser lançado!</p>
+        <p class="small"><b>Estilingue:</b> aproxime-se e o gato entra sozinho. Arraste com o mouse (ou dedo) para trás e solte para lançar!</p>
         <p class="small">Cuidado com espinhos, inimigos e precipícios (friso amarelo).</p>
         <button id="btnStart">Começar a aventura</button>
         <button id="btnBackMenu" class="secondary">Voltar ao menu</button>
@@ -212,6 +210,12 @@
   const COYOTE_FRAMES = 7, JUMP_BUFFER_FRAMES = 8;
   const PLAYER_W = 34, PLAYER_H = 22;
 
+  // Angry Birds style slingshot
+  const SLING_MAX_PULL = 70;          // pixels max pull distance
+  const SLING_FORCE = 0.22;           // multiplier for velocity
+  const TRAJECTORY_POINTS = 18;       // how many dots to show (short arc)
+  const TRAJECTORY_STEP = 2.2;        // simulation step for prediction
+
   let state = "menu";
   let gameMode = "levels";
   let keys = { left:false, right:false, jump:false };
@@ -221,6 +225,13 @@
   let level, tokens, lives, cameraX, camY, levelLength, levelMinY;
   let invincibleTimer = 0, shakeTimer = 0, transitionTimer = 0;
   let endlessDistance = 0;
+
+  // Slingshot aiming state
+  let aiming = false;
+  let activeSling = null;
+  let pullX = 0, pullY = 0;           // current pull offset from pad
+  let isDragging = false;
+  let camZoom = 1;                    // 1 = normal, <1 = zoomed out
 
   // Personalização
   let catCustom = {
@@ -289,7 +300,7 @@
       ground.push({x1:startX,x2:startX+120});
       const chasmW = rand(300, 360+n*10);
       const chasmStart = startX+120, chasmEnd = chasmStart+chasmW;
-      slingshots.push({padX,padY,chasmStart,chasmEnd});
+      slingshots.push({padX,padY,chasmStart,chasmEnd, used:false});
       const steps=6;
       for (let i=1;i<steps;i++){
         const t=i/steps;
@@ -417,16 +428,18 @@
 
   function resetRun(){
     level=1; tokens=0; lives=3; endlessDistance=0;
+    aiming=false; activeSling=null; isDragging=false; pullX=0; pullY=0; camZoom=1;
     buildLevel(level);
     spawnPlayer();
     updateHud();
   }
   function spawnPlayer(){
-    player = { x:50, y:GROUND_Y-PLAYER_H, vx:0, vy:0, w:PLAYER_W, h:PLAYER_H, facing:1, onGround:false, coyote:0, runPhase:0, charge:0 };
+    player = { x:50, y:GROUND_Y-PLAYER_H, vx:0, vy:0, w:PLAYER_W, h:PLAYER_H, facing:1, onGround:false, coyote:0, runPhase:0 };
     cameraX=0; camY=0; invincibleTimer=30;
   }
   function nextLevel(){
     level++; buildLevel(level); spawnPlayer(); updateHud();
+    aiming=false; activeSling=null; isDragging=false; pullX=0; pullY=0; camZoom=1;
   }
   function updateHud(){
     levelLabel.textContent = gameMode==="endless" ? "∞" : level;
@@ -470,6 +483,103 @@
   bindHold(document.getElementById("btnLeft"), ()=>keys.left=true, ()=>keys.left=false);
   bindHold(document.getElementById("btnRight"), ()=>keys.right=true, ()=>keys.right=false);
   bindHold(document.getElementById("jumpBtn"), ()=>{ if(!keys.jump) jumpPressedBuffer=JUMP_BUFFER_FRAMES; keys.jump=true; }, ()=>keys.jump=false);
+
+  // ---- Mouse / Touch for Angry Birds slingshot ----
+  function getCanvasPos(e){
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    let clientX, clientY;
+    if (e.touches && e.touches.length) {
+      clientX = e.touches[0].clientX;
+      clientY = e.touches[0].clientY;
+    } else {
+      clientX = e.clientX;
+      clientY = e.clientY;
+    }
+    return {
+      x: (clientX - rect.left) * scaleX,
+      y: (clientY - rect.top) * scaleY
+    };
+  }
+
+  function worldFromScreen(sx, sy){
+    // inverse of the draw transform (camera + zoom)
+    const zx = W/2 + (sx - W/2) / camZoom;
+    const zy = H/2 + (sy - H/2) / camZoom;
+    return { x: zx + cameraX, y: zy + camY };
+  }
+
+  function startDrag(e){
+    if (state !== "playing" || !aiming || !activeSling) return;
+    e.preventDefault();
+    isDragging = true;
+    updatePull(e);
+  }
+
+  function moveDrag(e){
+    if (!isDragging || !aiming) return;
+    e.preventDefault();
+    updatePull(e);
+  }
+
+  function endDrag(e){
+    if (!isDragging || !aiming || !activeSling) return;
+    e.preventDefault();
+    isDragging = false;
+    launchFromSling();
+  }
+
+  function updatePull(e){
+    const pos = getCanvasPos(e);
+    const world = worldFromScreen(pos.x, pos.y);
+    // pull vector is from pad to mouse (inverted for Angry Birds feel)
+    let dx = world.x - activeSling.padX;
+    let dy = world.y - activeSling.padY;
+    // clamp to max pull
+    const dist = Math.hypot(dx, dy);
+    if (dist > SLING_MAX_PULL) {
+      dx = dx / dist * SLING_MAX_PULL;
+      dy = dy / dist * SLING_MAX_PULL;
+    }
+    // only allow pulling mostly left/up (classic Angry Birds)
+    if (dx > 10) dx = 10;
+    pullX = dx;
+    pullY = dy;
+  }
+
+  function launchFromSling(){
+    if (!activeSling) return;
+    // velocity is opposite of pull
+    const power = Math.hypot(pullX, pullY);
+    if (power < 8) {
+      // too weak – cancel aim
+      aiming = false;
+      activeSling = null;
+      pullX = 0; pullY = 0;
+      camZoom = 1;
+      return;
+    }
+    player.vx = -pullX * SLING_FORCE;
+    player.vy = -pullY * SLING_FORCE;
+    player.onGround = false;
+    player.facing = player.vx >= 0 ? 1 : -1;
+    spawnBurst(activeSling.padX, activeSling.padY - 20, "#ffd166", 16);
+    activeSling.used = true;
+    aiming = false;
+    activeSling = null;
+    pullX = 0; pullY = 0;
+    isDragging = false;
+    // camera will smoothly return
+  }
+
+  canvas.addEventListener("mousedown", startDrag);
+  canvas.addEventListener("mousemove", moveDrag);
+  window.addEventListener("mouseup", endDrag);
+  canvas.addEventListener("touchstart", startDrag, {passive:false});
+  canvas.addEventListener("touchmove", moveDrag, {passive:false});
+  window.addEventListener("touchend", endDrag);
+  window.addEventListener("touchcancel", endDrag);
 
   // Menu buttons
   document.getElementById("btnLevels").addEventListener("click", ()=>{
@@ -547,7 +657,8 @@
 
   function respawnOnLevel(){
     player.x=50; player.y=GROUND_Y-player.h; player.vx=0; player.vy=0;
-    cameraX=0; camY=0; invincibleTimer=40; player.charge=0;
+    cameraX=0; camY=0; invincibleTimer=40;
+    aiming=false; activeSling=null; isDragging=false; pullX=0; pullY=0; camZoom=1;
   }
 
   // ================= CUSTOM UI =================
@@ -630,26 +741,47 @@
     if (jumpPressedBuffer>0) jumpPressedBuffer--;
     if (player.coyote>0) player.coyote--;
 
-    let chargingNow=false, justLaunched=false;
-    for (const s of slingshots) {
-      const onPad = player.onGround && Math.abs((player.x+player.w/2)-s.padX)<22;
-      if (onPad && keys.jump) {
-        player.charge = Math.min(1, player.charge+0.032);
-        chargingNow=true; player.vx=0; player.vy=0;
-      } else if (onPad && !keys.jump && player.charge>0) {
-        if (player.charge>0.12) {
-          // Estilingue corrigido: mais força para frente
-          player.vx = 5.8 + player.charge * 11.5;
-          player.vy = -(5.4 + player.charge * 5.2);
-          player.onGround=false; justLaunched=true;
-          spawnBurst(s.padX, s.padY-24, "#ffd166", 14);
+    // ---- SLINGSHOT AUTO-SNAP + AIMING ----
+    if (!aiming) {
+      for (const s of slingshots) {
+        if (s.used) continue;
+        const dx = (player.x + player.w/2) - s.padX;
+        const dy = (player.y + player.h) - s.padY;
+        if (Math.abs(dx) < 28 && Math.abs(dy) < 18 && player.onGround) {
+          // snap to slingshot
+          aiming = true;
+          activeSling = s;
+          player.x = s.padX - player.w/2;
+          player.y = s.padY - player.h - 4;
+          player.vx = 0;
+          player.vy = 0;
+          player.onGround = true;
+          pullX = 0; pullY = 0;
+          isDragging = false;
+          break;
         }
-        player.charge=0;
       }
     }
-    if (!chargingNow && player.charge>0 && !justLaunched) player.charge=0;
 
-    if (!chargingNow && !justLaunched) {
+    if (aiming && activeSling) {
+      // keep player on the rubber band
+      player.x = activeSling.padX + pullX - player.w/2;
+      player.y = activeSling.padY + pullY - player.h - 4;
+      player.vx = 0;
+      player.vy = 0;
+      player.onGround = true;
+
+      // camera zoom out based on pull strength
+      const pullPower = Math.hypot(pullX, pullY) / SLING_MAX_PULL;
+      const targetZoom = 1 - pullPower * 0.28; // max ~0.72
+      camZoom += (targetZoom - camZoom) * 0.12;
+    } else {
+      // return zoom to normal
+      camZoom += (1 - camZoom) * 0.08;
+    }
+
+    // Normal movement only when NOT aiming
+    if (!aiming) {
       if (keys.left && !keys.right) { player.vx -= ACCEL; player.facing=-1; }
       else if (keys.right && !keys.left) { player.vx += ACCEL; player.facing=1; }
       else { player.vx *= FRICTION; if (Math.abs(player.vx)<0.05) player.vx=0; }
@@ -658,38 +790,37 @@
         player.vy=JUMP_VELOCITY; player.onGround=false; player.coyote=0; jumpPressedBuffer=0;
         spawnBurst(player.x+player.w/2, player.y+player.h, "#ffffff", 6);
       }
-    }
 
-    player.x += player.vx;
-    if (gameMode!=="endless") player.x = Math.max(0, Math.min(player.x, levelLength-player.w));
-    else player.x = Math.max(0, player.x);
+      player.x += player.vx;
+      if (gameMode!=="endless") player.x = Math.max(0, Math.min(player.x, levelLength-player.w));
+      else player.x = Math.max(0, player.x);
 
-    if (!chargingNow) {
       player.vy += GRAVITY;
       if (player.vy>MAX_FALL) player.vy=MAX_FALL;
+
+      const prevBottom = player.y+player.h;
+      player.y += player.vy;
+      const newBottom = player.y+player.h;
+      let landed=false;
+      if (player.vy>=0) {
+        for (const s of allSolids()) {
+          const withinX = player.x+player.w*0.75>s.x1 && player.x+player.w*0.25<s.x2;
+          if (withinX && prevBottom<=s.y+1 && newBottom>=s.y) { player.y=s.y-player.h; player.vy=0; landed=true; }
+        }
+      }
+      player.onGround = landed;
+      if (landed) player.coyote = COYOTE_FRAMES;
     }
 
-    const prevBottom = player.y+player.h;
-    player.y += player.vy;
-    const newBottom = player.y+player.h;
-    let landed=false;
-    if (player.vy>=0) {
-      for (const s of allSolids()) {
-        const withinX = player.x+player.w*0.75>s.x1 && player.x+player.w*0.25<s.x2;
-        if (withinX && prevBottom<=s.y+1 && newBottom>=s.y) { player.y=s.y-player.h; player.vy=0; landed=true; }
-      }
-    }
-    player.onGround = landed;
-    if (landed) player.coyote = COYOTE_FRAMES;
     player.runPhase += Math.abs(player.vx)*0.28;
 
-    if (invincibleTimer<=0) {
+    if (invincibleTimer<=0 && !aiming) {
       for (const sp of spikes) {
         const dx=Math.abs((player.x+player.w/2)-sp.x);
         if (dx<16 && (player.y+player.h)>sp.y-16) { loseLife(player.x+player.w/2<sp.x?-1:1); break; }
       }
     }
-    if (invincibleTimer<=0) {
+    if (invincibleTimer<=0 && !aiming) {
       for (const h of hazards) {
         const dx=Math.abs((player.x+player.w/2)-h.x), dy=Math.abs((player.y+player.h/2)-h.y);
         if (dx<18 && dy<18) { loseLife(player.x+player.w/2<h.x?-1:1); break; }
@@ -700,6 +831,7 @@
       if (!en.alive) continue;
       en.x += en.vx; if (en.x<en.x1||en.x>en.x2) en.vx*=-1;
       en.wobble += 0.2;
+      if (aiming) continue;
       const ex1=en.x-12, ex2=en.x+12, ey=en.y;
       const overlapX = player.x+player.w>ex1 && player.x<ex2;
       const overlapY = player.y+player.h>ey-20 && player.y<ey;
@@ -713,6 +845,7 @@
     for (const c of coins) {
       if (c.taken) continue;
       c.floaty += 0.08;
+      if (aiming) continue;
       const dx=(player.x+player.w/2)-c.x, dy=(player.y+player.h/2)-c.y;
       if (Math.hypot(dx,dy)<22) { c.taken=true; tokens++; spawnBurst(c.x,c.y,"#ffd166",8); updateHud(); }
     }
@@ -725,7 +858,12 @@
       showToast("Fase "+level+" completa! 🐟");
     }
 
-    const targetX = Math.max(0, Math.min(player.x-W*0.38, gameMode==="endless" ? player.x+400 : levelLength-W));
+    // Camera follow
+    let targetX = Math.max(0, Math.min(player.x-W*0.38, gameMode==="endless" ? player.x+400 : levelLength-W));
+    if (aiming && activeSling) {
+      // center more on the sling while aiming
+      targetX = activeSling.padX - W*0.45;
+    }
     cameraX += (targetX-cameraX)*0.18;
     const targetY = Math.max(levelMinY, Math.min(player.y-H*0.55, 0));
     camY += (targetY-camY)*0.12;
@@ -747,7 +885,6 @@
     ctx.closePath();
   }
 
-  // versão que aceita contexto (para o preview)
   function roundRectCtx(c, x,y,w,h,r){
     c.beginPath();
     c.moveTo(x+r,y);
@@ -960,27 +1097,66 @@
   function drawSlingshots(){
     for (const s of slingshots) {
       const sx=SX(s.padX), sy=SY(s.padY);
-      if (sx<-30 || sx>W+30) continue;
+      if (sx<-40 || sx>W+40) continue;
+
+      // poles
       ctx.strokeStyle="#6e4a28"; ctx.lineWidth=5; ctx.lineCap="round";
       ctx.beginPath();
-      ctx.moveTo(sx-10, sy); ctx.lineTo(sx-10, sy-38);
-      ctx.moveTo(sx+10, sy); ctx.lineTo(sx+10, sy-38);
+      ctx.moveTo(sx-12, sy); ctx.lineTo(sx-12, sy-42);
+      ctx.moveTo(sx+12, sy); ctx.lineTo(sx+12, sy-42);
       ctx.stroke();
-      const onThisPad = player && player.onGround && Math.abs((player.x+player.w/2)-s.padX)<22;
-      const pull = onThisPad ? player.charge : 0;
-      ctx.strokeStyle="#c9457a"; ctx.lineWidth=3;
-      ctx.beginPath();
-      ctx.moveTo(sx-10, sy-38);
-      ctx.lineTo(sx - pull*26, sy-16);
-      ctx.lineTo(sx+10, sy-38);
-      ctx.stroke();
-      if (pull>0.02) {
-        ctx.fillStyle="#241a3d";
-        roundRect(sx-22, sy-58, 44, 8, 4); ctx.fill();
-        ctx.fillStyle="#ffd166";
-        roundRect(sx-20, sy-56, 40*pull, 4, 2); ctx.fill();
+
+      // rubber bands
+      if (aiming && activeSling === s) {
+        // stretched to the cat
+        const catCenterX = SX(player.x + player.w/2);
+        const catCenterY = SY(player.y + player.h/2);
+        ctx.strokeStyle="#c9457a"; ctx.lineWidth=3.5;
+        ctx.beginPath();
+        ctx.moveTo(sx-12, sy-42);
+        ctx.lineTo(catCenterX, catCenterY);
+        ctx.lineTo(sx+12, sy-42);
+        ctx.stroke();
+      } else {
+        // resting band
+        ctx.strokeStyle="#c9457a"; ctx.lineWidth=3;
+        ctx.beginPath();
+        ctx.moveTo(sx-12, sy-42);
+        ctx.lineTo(sx, sy-18);
+        ctx.lineTo(sx+12, sy-42);
+        ctx.stroke();
       }
     }
+  }
+
+  // ---- Trajectory prediction (short arc like Angry Birds) ----
+  function drawTrajectory(){
+    if (!aiming || !activeSling) return;
+    const power = Math.hypot(pullX, pullY);
+    if (power < 6) return;
+
+    let vx = -pullX * SLING_FORCE;
+    let vy = -pullY * SLING_FORCE;
+    let x = activeSling.padX + pullX;
+    let y = activeSling.padY + pullY - 8;
+
+    ctx.save();
+    ctx.fillStyle = "rgba(255,255,255,0.75)";
+    for (let i = 0; i < TRAJECTORY_POINTS; i++) {
+      // simulate a few steps
+      for (let s = 0; s < TRAJECTORY_STEP; s++) {
+        x += vx;
+        y += vy;
+        vy += GRAVITY * 0.85; // slightly lighter for nicer arc
+      }
+      const alpha = 1 - (i / TRAJECTORY_POINTS);
+      ctx.globalAlpha = alpha * 0.85;
+      const r = 3.2 - i * 0.08;
+      ctx.beginPath();
+      ctx.arc(SX(x), SY(y), Math.max(1.2, r), 0, Math.PI*2);
+      ctx.fill();
+    }
+    ctx.restore();
   }
 
   function drawFlag(){
@@ -1007,7 +1183,6 @@
     const legSwing = Math.sin(runPhase) * 5;
     const legSwing2 = Math.sin(runPhase + Math.PI) * 5;
 
-    // cauda
     c.strokeStyle = catCustom.body;
     c.lineWidth = 5;
     c.lineCap = "round";
@@ -1016,21 +1191,17 @@
     c.quadraticCurveTo(-28, -12 + Math.sin(runPhase*0.7)*4, -26, -22);
     c.stroke();
 
-    // corpo
     c.fillStyle = catCustom.body;
     roundRectCtx(c, -16, -8, 30, 14, 7); c.fill();
 
-    // barriga
     c.fillStyle = catCustom.belly;
     roundRectCtx(c, -12, -2, 22, 7, 4); c.fill();
 
-    // cabeça
     c.fillStyle = catCustom.body;
     c.beginPath();
     c.arc(14, -6, 10, 0, Math.PI*2);
     c.fill();
 
-    // orelhas
     c.beginPath();
     c.moveTo(8, -13); c.lineTo(7, -22); c.lineTo(13, -14);
     c.closePath();
@@ -1038,7 +1209,6 @@
     c.closePath();
     c.fill();
 
-    // orelhas internas
     c.fillStyle = "#ffb0c0";
     c.beginPath();
     c.moveTo(9, -14); c.lineTo(9, -19); c.lineTo(12, -14);
@@ -1047,20 +1217,17 @@
     c.closePath();
     c.fill();
 
-    // olhos
     c.fillStyle = "#2b2440";
     c.beginPath();
     c.arc(12, -7, 2.2, 0, Math.PI*2);
     c.arc(18, -7, 2.2, 0, Math.PI*2);
     c.fill();
 
-    // nariz
     c.fillStyle = "#c9457a";
     c.beginPath();
     c.arc(15, -3.5, 1.8, 0, Math.PI*2);
     c.fill();
 
-    // patas
     c.strokeStyle = catCustom.body;
     c.lineWidth = 4.5;
     c.lineCap = "round";
@@ -1085,7 +1252,6 @@
     c.lineTo(-4 - legSwing2*0.4, 12);
     c.stroke();
 
-    // gravatinha
     if (catCustom.bow) {
       c.fillStyle = "#c9457a";
       c.beginPath();
@@ -1114,7 +1280,16 @@
   function draw(){
     ctx.clearRect(0,0,W,H);
     ctx.save();
+
+    // camera zoom (Angry Birds style)
+    if (camZoom !== 1) {
+      ctx.translate(W/2, H/2);
+      ctx.scale(camZoom, camZoom);
+      ctx.translate(-W/2, -H/2);
+    }
+
     if (shakeTimer>0) ctx.translate(rand(-3,3), rand(-3,3));
+
     drawSky();
     if (ground) {
       drawVoids();
@@ -1127,6 +1302,7 @@
       drawHazards();
       drawCoins();
       drawEnemies();
+      drawTrajectory();          // <-- short trajectory dots
     }
     (particles||[]).forEach(p=>{
       ctx.globalAlpha=Math.max(p.life/28,0);
